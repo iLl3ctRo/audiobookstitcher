@@ -1,76 +1,82 @@
-# Audiobook Stitcher (Tauri Edition)
+# Audiobook Stitcher
 
-A cross-platform desktop app built with Tauri (Rust backend + React frontend) that merges a directory of chapter audio files into a polished `.m4b` audiobook. The application normalises source audio in parallel via FFmpeg, embeds metadata/cover art, and provides real-time progress feedback in a modern UI.
+Audiobook Stitcher is an open source desktop app that merges a folder of chapter audio files into a polished `.m4b` audiobook. It ships a friendly React interface on top of a high-performance Rust/Tauri backend so you get cross-platform builds, multi-core FFmpeg processing, and real-time progress feedback in one package.
 
-## Project structure
+![Audiobook Stitcher UI](docs/screenshot.png)
+
+## ✨ Features
+
+- 🗂 Natural sorting of chapter files (`.m4a`, `.mp3`, `.aac`, `.wav`, `.flac`, `.ogg`, `.aiff`, `.m4b`)
+- ⚙️ Parallel FFmpeg normalisation with configurable bitrate, sample rate, and worker count
+- 🏷 Metadata embedding (title, author, narrator, album, year) plus optional cover art
+- 📚 Automatic chapter generation—each input file becomes a chapter marker in the final `.m4b`
+- 📦 Bundled FFmpeg support so releases are self-contained on macOS, Windows, and Linux
+- 📈 Rich progress stream (log view, status pill, result summary) for long-running jobs
+
+## 📁 Repository layout
 
 ```
-.
-├── tauri-app/
-│   ├── frontend/         # React + Vite UI
-│   └── src-tauri/        # Rust backend + Tauri configuration
-└── legacy-python/        # (Optional) original Python CLI, retained for reference
+frontend/    React + Vite UI
+src-tauri/   Rust backend + Tauri configuration
+docs/        Screenshots and ancillary assets (optional)
 ```
 
-> The legacy Python implementation has been archived under `legacy-python/` for posterity. The Tauri app is now the primary codebase.
+## 🚀 Getting started
 
-## Features
+Prerequisites:
 
-- Natural sort of supported chapter files (`.m4a`, `.mp3`, `.aac`, `.wav`, `.flac`, `.ogg`, `.aiff`, `.m4b`).
-- Parallel FFmpeg normalisation with configurable worker count, bitrate, and sample rate.
-- Metadata embedding (title, author, narrator, album, year) and optional cover artwork.
-- Automatic chapter marker generation—each source file becomes a chapter in the final `.m4b`.
-- Bundled FFmpeg binary support for fully self-contained distributions.
-- Real-time progress stream with per-stage updates and structured result summaries.
+- Node.js 18+
+- Rust toolchain 1.91+ (`rustup default stable`)
+- `cargo-tauri` CLI (`cargo install tauri-cli --locked`)
+- FFmpeg binaries available on your `PATH` (or bundled—see below)
 
-## Requirements
-
-- Node.js ≥ 18 (for the React frontend).
-- Rust toolchain ≥ 1.91 (install via `rustup`).
-- `cargo-tauri` CLI (`cargo install tauri-cli --locked`).
-- FFmpeg binaries for your target platforms (see [Bundling FFmpeg](#bundling-ffmpeg)).
-
-## Getting started
-
-Install frontend dependencies:
+Install dependencies:
 
 ```bash
-cd tauri-app/frontend
+cd frontend
 npm install
 ```
 
-Run the app in development mode (watches both frontend and backend):
+Start the dev environment (launches Vite + Tauri in one go):
 
 ```bash
-cd tauri-app
+npm run tauri:dev        # from the repository root
+# or
+cd src-tauri
 cargo tauri dev
 ```
 
-The UI will open in a Tauri window. Select a chapter directory, adjust metadata/encoding preferences, and click **Start stitching** to launch the Rust pipeline.
+The app window will open automatically. Pick a chapter directory, tweak metadata, and hit **Start stitching** to produce your `.m4b`.
 
-## Building a release bundle
+## 🏗 Building releases
 
-1. (Optional) Place platform-specific FFmpeg binaries under `tauri-app/src-tauri/resources/bin/...` (see below).
-2. Build the frontend once: `npm --prefix tauri-app/frontend run build`
-3. Produce installers/binaries: `cd tauri-app && cargo tauri build`
+1. (Optional) Drop platform-specific FFmpeg/ffprobe binaries into `src-tauri/resources/bin/<platform>/`.
+2. Build the frontend assets:
+   ```bash
+   npm run build:frontend
+   ```
+3. Produce native bundles:
+   ```bash
+   npm run tauri:build        # or: cd src-tauri && cargo tauri build
+   ```
 
-Artifacts are emitted under `tauri-app/src-tauri/target/release/`. Tauri produces platform-appropriate bundles (DMG/APP for macOS, MSI/EXE for Windows, AppImage/Deb for Linux).
+Artifacts land under `src-tauri/target/release/` (DMG/APP for macOS, MSI/EXE for Windows, AppImage/Deb for Linux).
 
-## Bundling FFmpeg
+### Bundling FFmpeg
 
-The app looks for FFmpeg in three places (in order):
+At runtime the app looks for FFmpeg/ffprobe in this order:
 
-1. `FFMPEG_PATH` environment variable (useful during development).
-2. A system installation discoverable via `which ffmpeg`.
-3. A bundled binary in `resources/bin/<platform>/ffmpeg`.
+1. `FFMPEG_PATH` / `FFPROBE_PATH` environment variables
+2. Executables discoverable via `which ffmpeg` / `which ffprobe`
+3. Bundled binaries inside `src-tauri/resources/bin/<platform>/`
 
-To ship FFmpeg with your build, drop static binaries into the following paths before running `cargo tauri build`:
+To ship with bundled binaries, place the files here before building:
 
-- `tauri-app/src-tauri/resources/bin/macos-universal/ffmpeg` (and `ffprobe`)
-- `tauri-app/src-tauri/resources/bin/windows-x64/ffmpeg.exe` (and `ffprobe.exe`)
-- `tauri-app/src-tauri/resources/bin/linux-x64/ffmpeg` (and `ffprobe`)
+- `src-tauri/resources/bin/macos-universal/{ffmpeg,ffprobe}`
+- `src-tauri/resources/bin/windows-x64/{ffmpeg.exe,ffprobe.exe}`
+- `src-tauri/resources/bin/linux-x64/{ffmpeg,ffprobe}`
 
-Then ensure these assets are copied into the final bundle by adding the corresponding glob to `bundle.resources` inside `tauri.conf.json`, e.g.
+Then ensure `tauri.conf.json` includes:
 
 ```json
 {
@@ -82,37 +88,35 @@ Then ensure these assets are copied into the final bundle by adding the correspo
 }
 ```
 
-The repository keeps small placeholder files in each folder so the layout is tracked in version control; replace them with real FFmpeg binaries for release builds.
+## 🧠 Architecture at a glance
 
-## Rust backend overview
+- The Tauri command in `src-tauri/src/stitcher.rs` orchestrates the pipeline:
+  1. Gather & naturally sort audio files
+  2. Normalise each file via FFmpeg in an async worker pool
+  3. Use ffprobe to capture durations and emit an FFmetadata chapter file
+  4. Concatenate everything into a fast-start `.m4b`, embedding metadata and cover art
+- Progress events (`stitch-progress`) stream back to the React UI so the log and status indicators stay up to date.
 
-The backend logic lives in `tauri-app/src-tauri/src/stitcher.rs` and mirrors the behaviour of the previous Python tool:
+## 🤝 Contributing
 
-- Collects/validates source files, computes natural ordering, and derives a default output location.
-- Normalises each chapter via FFmpeg in a thread pool (`tokio::process::Command` + `buffer_unordered` for concurrency).
-- Samples track durations with `ffprobe` and emits an FFmetadata manifest so every chapter is preserved in the final file.
-- Writes a temporary concat manifest and runs a final FFmpeg muxing pass to assemble the `.m4b`.
-- Emits structured progress events (`stitch-progress`) to the renderer and returns a summary payload when complete.
-- Provides detailed error propagation when FFmpeg fails (exit code + stderr).
+Bug reports, feature ideas, and pull requests are welcome! If you’re looking for somewhere to jump in, check the open issues or tackle one of these roadmap items:
 
-## React frontend overview
+- UI support for editing/reordering chapter titles prior to export
+- Job cancellation and queue management for batch processing
+- Signed installers / package feeds (Homebrew, winget, etc.)
+- Integrations with library managers (drag-and-drop, watch folders)
 
-The UI in `tauri-app/frontend/src/App.tsx` offers:
+To submit a change:
 
-- Form-driven configuration with directory/file pickers powered by `@tauri-apps/plugin-dialog`.
-- Live progress bar, stage indicators, and timestamped log stream.
-- Result snapshot (output path, chapters merged, elapsed time) on success.
-- Error section for failed runs.
+1. Fork & clone the repo
+2. Create a feature branch
+3. Run `npm run lint` (frontend) and `cargo fmt && cargo check`
+4. Open a PR describing the change
 
-State is managed with plain React hooks; commands are invoked via `@tauri-apps/api/core`.
+## 📄 License
 
-## Legacy CLI (optional)
+Released under the MIT License. See [LICENSE](LICENSE) for details.
 
-The historical Python CLI has been moved to `legacy-python/` in case you need a headless workflow or a reference for future migrations. The Dockerfile and related scripts were retired as part of the Tauri rewrite.
+---
 
-## Next steps
-
-1. Allow chapter title editing/reordering before export.
-2. Add cancellation support and background queueing for multiple jobs.
-3. Package signed binaries for distribution channels (Homebrew, Winget, etc.).
-4. Integrate with audiobook libraries (e.g. OpenAudible) via drag-and-drop or watched folders.
+Built with ❤️ by the Audiobook Stitcher community. Happy listening!
