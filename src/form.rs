@@ -5,8 +5,25 @@ use crate::stitcher::StitchOptions;
 pub const LOG_CAP: usize = 250;
 pub const EMPTY_SOURCE_ERROR: &str = "Select a source directory to continue.";
 pub const SAMPLE_RATE_ERROR: &str = "Sample rate must be a whole number, e.g. 44100";
+pub const BITRATE_ERROR: &str = "Bitrate must look like 96k, 128k or 64000";
 pub const WORKERS_ERROR: &str = "Workers must be a whole number or empty";
 pub const COVER_ERROR: &str = "Cover image must be a .jpg, .jpeg or .png file.";
+
+/// Empty, or a number with an optional k/M suffix that ffmpeg's `-b:a` accepts.
+fn is_valid_bitrate(value: &str) -> bool {
+    let v = value.trim();
+    let digits = v.strip_suffix(['k', 'K', 'm', 'M']).unwrap_or(v);
+    if v.is_empty() {
+        return true;
+    }
+    let mut parts = digits.splitn(2, '.');
+    let whole = parts.next().unwrap_or("");
+    let frac = parts.next();
+    !whole.is_empty()
+        && whole.chars().all(|c| c.is_ascii_digit())
+        && frac.is_none_or(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()))
+        && digits.chars().any(|c| c != '0' && c != '.')
+}
 
 /// Empty -> `Ok(None)`; a positive integer -> `Ok(Some(n))`; anything else -> `Err(())`.
 fn parse_positive<T: std::str::FromStr + PartialEq + Default>(
@@ -67,6 +84,9 @@ impl FormState {
         let source_dir = self.source_dir.trim();
         if source_dir.is_empty() {
             return Err(EMPTY_SOURCE_ERROR);
+        }
+        if !is_valid_bitrate(&self.bitrate) {
+            return Err(BITRATE_ERROR);
         }
         let sample_rate = parse_positive(&self.sample_rate).map_err(|_| SAMPLE_RATE_ERROR)?;
         let workers = parse_positive(&self.workers).map_err(|_| WORKERS_ERROR)?;
@@ -135,6 +155,24 @@ pub fn percent(current: usize, total: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitrate_validation() {
+        for ok in ["", "  ", "96k", "128K", "64000", "1.5M", " 96k "] {
+            assert!(is_valid_bitrate(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "abc", "k", "96 k", "-96k", "0", "0k", "1.k", ".5k", "96kbps", "9e3",
+        ] {
+            assert!(!is_valid_bitrate(bad), "{bad:?} should be invalid");
+        }
+        let f = FormState {
+            source_dir: "/x".into(),
+            bitrate: "abc".into(),
+            ..FormState::default()
+        };
+        assert_eq!(f.to_options().unwrap_err(), BITRATE_ERROR);
+    }
 
     #[test]
     fn empty_source_rejected() {
