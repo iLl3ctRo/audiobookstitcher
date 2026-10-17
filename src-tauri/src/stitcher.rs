@@ -376,7 +376,17 @@ async fn normalize_sources(
             match run_ffmpeg(&ffmpeg, args).await {
                 Ok(()) => {
                     let duration_ms = probe_duration(&ffprobe, &target).await?;
-                    let title = derive_chapter_title(&source, index + 1);
+                    let probed_title = match probe_chapter_title(&ffprobe, &source).await {
+                        Ok(title) => title,
+                        Err(err) => {
+                            log::warn!(
+                                "failed to probe chapter title for {}: {err}",
+                                source.display()
+                            );
+                            None
+                        }
+                    };
+                    let title = derive_chapter_title(&source, index + 1, probed_title.as_deref());
                     let finished = progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
                     emit_progress(
                         &window,
@@ -503,19 +513,38 @@ fn escape_ffmetadata_value(value: &str) -> String {
     escaped
 }
 
-fn derive_chapter_title(source: &Path, index: usize) -> String {
-    let fallback = format!("Chapter {}", index);
-    let stem = match source.file_stem().and_then(OsStr::to_str) {
-        Some(raw) if !raw.trim().is_empty() => raw,
-        _ => return fallback,
-    };
-    let cleaned = stem.replace('_', " ").replace('-', " ");
-    let trimmed = cleaned.trim();
+fn clean_title(raw: &str) -> Option<String> {
+    let spaced = raw.replace('_', " ").replace('-', " ");
+    let trimmed = spaced.trim();
     if trimmed.is_empty() {
-        fallback
-    } else {
-        trimmed.to_string()
+        return None;
     }
+
+    let normalized = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn derive_chapter_title(source: &Path, index: usize, probed_title: Option<&str>) -> String {
+    let fallback = format!("Chapter {}", index);
+
+    if let Some(title) = probed_title.and_then(clean_title) {
+        return title;
+    }
+
+    if let Some(file_stem) = source.file_stem().and_then(OsStr::to_str) {
+        if let Some(title) = clean_title(file_stem) {
+            return title;
+        }
+    }
+
+    fallback
 }
 
 async fn finalize_audiobook(
@@ -656,6 +685,43 @@ async fn probe_duration(ffprobe: &Path, file: &Path) -> Result<u64, StitchError>
 
     let duration_ms = millis as u64;
     Ok(duration_ms.max(1))
+}
+
+async fn probe_chapter_title(
+    ffprobe: &Path,
+    file: &Path,
+) -> Result<Option<String>, StitchError> {
+    let mut args: Vec<OsString> = Vec::with_capacity(12);
+    args.push("-v".into());
+    args.push("error".into());
+    args.push("-show_entries".into());
+    args.push("format_tags=title:stream_tags=title".into());
+    args.push("-of".into());
+    args.push("default=noprint_wrappers=1:nokey=1".into());
+    args.push(file.as_os_str().to_os_string());
+
+    let mut command = Command::new(ffprobe);
+    command.args(&args);
+    let command_str = to_command_string(ffprobe, &args);
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(StitchError::FfprobeFailed {
+            command: command_str,
+            code: output.status.code(),
+            stderr,
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let title = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string());
+
+    Ok(title)
 }
 
 fn to_command_string(executable: &Path, args: &[OsString]) -> String {
