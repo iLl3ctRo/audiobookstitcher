@@ -498,6 +498,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui-component",
+ "libc",
  "log",
  "num_cpus",
  "once_cell",

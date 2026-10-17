@@ -33,6 +33,7 @@ which = "6"
 num_cpus = "1.16"
 shellexpand = "3"
 async-channel = "2"
+libc = "0.2"
 
 [package.metadata.bundle]
 name = "Audiobook Stitcher"
