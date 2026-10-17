@@ -1,6 +1,6 @@
 # Audiobook Stitcher
 
-Audiobook Stitcher is an open source desktop app that merges a folder of chapter audio files into a polished `.m4b` audiobook. It ships a friendly React interface on top of a high-performance Rust/Tauri backend so you get cross-platform builds, multi-core FFmpeg processing, and real-time progress feedback in one package.
+Audiobook Stitcher is an open source desktop app that merges a folder of chapter audio files into a polished `.m4b` audiobook. It is a pure-Rust native app (GPUI) with a high-performance FFmpeg backend, so you get cross-platform builds, multi-core FFmpeg processing, and real-time progress feedback in one package.
 
 ![Audiobook Stitcher UI](docs/screenshot.png)
 
@@ -16,86 +16,80 @@ Audiobook Stitcher is an open source desktop app that merges a folder of chapter
 ## 📁 Repository layout
 
 ```
-frontend/    React + Vite UI
-src-tauri/   Rust backend + Tauri configuration
-docs/        Screenshots and ancillary assets (optional)
+Cargo.toml          Crate manifest (+ cargo-bundle metadata)
+src/main.rs         Entry point
+src/app.rs          GPUI user interface
+src/form.rs         UI-free form logic (options conversion, log cap, ...)
+src/stitcher.rs     FFmpeg pipeline
+src/binaries.rs     Bundled ffmpeg/ffprobe lookup
+tests/e2e.rs        Ignored end-to-end test (needs ffmpeg)
+resources/bin/      Optional bundled FFmpeg binaries per platform
+assets/             App icons
 ```
 
 ## 🚀 Getting started
 
 Prerequisites:
 
-- Node.js 18+
 - Rust toolchain 1.91+ (`rustup default stable`)
-- `cargo-tauri` CLI (`cargo install tauri-cli --locked`)
-- FFmpeg binaries available on your `PATH` (or bundled—see below)
+- macOS: Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
+- FFmpeg binaries available on your `PATH` (or bundled, see below)
 
-Install dependencies:
-
-```bash
-cd frontend
-npm install
-```
-
-Start the dev environment (launches Vite + Tauri in one go):
+Run the app:
 
 ```bash
-npm run tauri:dev        # from the repository root
-# or
-cd src-tauri
-cargo tauri dev
+cargo run
 ```
 
-The app window will open automatically. Pick a chapter directory, tweak metadata, and hit **Start stitching** to produce your `.m4b`.
+Pick a chapter directory, tweak metadata, and hit **Start stitching** to produce your `.m4b`.
+
+The UI is built with [GPUI](https://gpui.rs) (`gpui 0.2.2`) and
+[`gpui-component`](https://github.com/longbridge/gpui-component) (`0.5.1`, the last release line built against crates.io `gpui`).
 
 ## 🏗 Building releases
 
-1. (Optional) Drop platform-specific FFmpeg/ffprobe binaries into `src-tauri/resources/bin/<platform>/`.
-2. Build the frontend assets:
-   ```bash
-   npm run build:frontend
-   ```
-3. Produce native bundles:
-   ```bash
-   npm run tauri:build        # or: cd src-tauri && cargo tauri build
-   ```
+```bash
+cargo build --release      # binary at target/release/audiobook-stitcher
+```
 
-Artifacts land under `src-tauri/target/release/` (DMG/APP for macOS, MSI/EXE for Windows, AppImage/Deb for Linux).
+On macOS you can produce an `.app` bundle with [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
 
-### Bundling FFmpeg
+```bash
+cargo install cargo-bundle
+cargo bundle --release
+```
+
+The `[package.metadata.bundle]` section in `Cargo.toml` configures the icon and copies `resources/bin` into the bundle.
+
+### FFmpeg resolution
 
 At runtime the app looks for FFmpeg/ffprobe in this order:
 
 1. `FFMPEG_PATH` / `FFPROBE_PATH` environment variables
-2. Executables discoverable via `which ffmpeg` / `which ffprobe`
-3. Bundled binaries inside `src-tauri/resources/bin/<platform>/`
+2. Executables discoverable on `PATH` (`ffmpeg` / `ffprobe`)
+3. Bundled binaries (non-empty files), checked in this order, as `ffmpeg` or `ffmpeg-<target-triple>` (e.g. `ffmpeg-aarch64-apple-darwin`):
+   - `<exe_dir>/resources/bin/<platform>/`
+   - `<exe_dir>/../Resources/bin/<platform>/` (macOS `.app`)
+   - `<exe_dir>/../Resources/resources/bin/<platform>/` (`cargo bundle` layout)
+   - `<crate>/resources/bin/<platform>/` (debug builds only)
 
-To ship with bundled binaries, place the files here before building:
+`<platform>` is `macos-universal`, `windows-x64` or `linux-x64`. ffprobe is additionally looked up next to the resolved ffmpeg.
 
-- `src-tauri/resources/bin/macos-universal/{ffmpeg,ffprobe}`
-- `src-tauri/resources/bin/windows-x64/{ffmpeg.exe,ffprobe.exe}`
-- `src-tauri/resources/bin/linux-x64/{ffmpeg,ffprobe}`
+## 🧪 Testing
 
-Then ensure `tauri.conf.json` includes:
-
-```json
-{
-  "bundle": {
-    "resources": [
-      "resources/bin/**"
-    ]
-  }
-}
+```bash
+cargo test                          # unit tests
+cargo test --test e2e -- --ignored  # real FFmpeg end-to-end run (needs ffmpeg/ffprobe)
 ```
 
 ## 🧠 Architecture at a glance
 
-- The Tauri command in `src-tauri/src/stitcher.rs` orchestrates the pipeline:
+- `stitcher::stitch_audiobook` orchestrates the pipeline:
   1. Gather & naturally sort audio files
   2. Normalise each file via FFmpeg in an async worker pool
   3. Use ffprobe to capture durations and emit an FFmetadata chapter file
   4. Concatenate everything into a fast-start `.m4b`, embedding metadata and cover art
-- Progress events (`stitch-progress`) stream back to the React UI so the log and status indicators stay up to date.
+- Progress is reported through a `ProgressSink` callback; the UI runs the job on a background tokio runtime and streams updates into the view over an async channel.
 
 ## 🤝 Contributing
 
@@ -110,7 +104,7 @@ To submit a change:
 
 1. Fork & clone the repo
 2. Create a feature branch
-3. Run `npm run lint` (frontend) and `cargo fmt && cargo check`
+3. Run `cargo fmt && cargo clippy --all-targets && cargo test`
 4. Open a PR describing the change
 
 ## 📄 License

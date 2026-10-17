@@ -18,9 +18,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use shellexpand::tilde;
-use tauri::{AppHandle, Emitter, Manager, Window};
 use tempfile::TempDir;
 use tokio::process::Command;
+
+use crate::binaries;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StitchError {
@@ -32,8 +33,6 @@ pub enum StitchError {
     NoAudioFiles(String),
     #[error("cover image not found: {0}")]
     CoverNotFound(String),
-    #[error("failed to determine resource directory")]
-    ResourcePath,
     #[error("ffmpeg not found. add it to PATH or bundle it under resources/bin.")]
     FfmpegNotFound,
     #[error("ffprobe not found. add it to PATH or bundle it under resources/bin.")]
@@ -60,7 +59,7 @@ pub enum StitchError {
     Other(String),
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressStage {
     Scanning,
@@ -69,6 +68,21 @@ pub enum ProgressStage {
     Complete,
     Failed,
 }
+
+impl ProgressStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProgressStage::Scanning => "scanning",
+            ProgressStage::Normalizing => "normalizing",
+            ProgressStage::Finalizing => "finalizing",
+            ProgressStage::Complete => "complete",
+            ProgressStage::Failed => "failed",
+        }
+    }
+}
+
+/// Receives progress updates while a job runs. Callable from any thread.
+pub type ProgressSink = Arc<dyn Fn(StitchProgress) + Send + Sync>;
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -95,7 +109,7 @@ pub struct StitchResult {
 }
 
 #[serde_as]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StitchOptions {
     pub source_dir: String,
@@ -118,11 +132,10 @@ static NATURAL_TOKEN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(\d+|\D+)").expect("valid natural sort regex"));
 
 pub async fn stitch_audiobook(
-    window: Window,
+    window: ProgressSink,
     options: StitchOptions,
 ) -> Result<StitchResult, StitchError> {
     let start = Instant::now();
-    let app_handle = window.app_handle();
 
     let source_dir = expand_path(&options.source_dir);
     let source_dir = source_dir
@@ -166,8 +179,8 @@ pub async fn stitch_audiobook(
         fs::create_dir_all(parent)?;
     }
 
-    let ffmpeg_path = resolve_ffmpeg(&app_handle)?;
-    let ffprobe_path = resolve_ffprobe(&app_handle, &ffmpeg_path)?;
+    let ffmpeg_path = resolve_ffmpeg()?;
+    let ffprobe_path = resolve_ffprobe(&ffmpeg_path)?;
 
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path().to_path_buf();
@@ -240,7 +253,7 @@ pub async fn stitch_audiobook(
 }
 
 fn emit_progress(
-    window: &Window,
+    window: &ProgressSink,
     stage: ProgressStage,
     current: usize,
     total: usize,
@@ -252,9 +265,7 @@ fn emit_progress(
         total,
         message,
     };
-    if let Err(err) = window.emit("stitch-progress", payload) {
-        log::warn!("failed to emit progress event: {err}");
-    }
+    window(payload);
 }
 
 fn expand_path(path: &str) -> PathBuf {
@@ -280,7 +291,7 @@ fn collect_audio_files(directory: &Path) -> Result<Vec<PathBuf>, StitchError> {
     Ok(files)
 }
 
-fn natural_compare(a: &Path, b: &Path) -> std::cmp::Ordering {
+pub fn natural_compare(a: &Path, b: &Path) -> std::cmp::Ordering {
     let a_key = natural_key(a);
     let b_key = natural_key(b);
     a_key.cmp(&b_key)
@@ -312,7 +323,7 @@ enum NaturalComponent {
     Text(String),
 }
 
-fn determine_output_path(
+pub fn determine_output_path(
     options: &StitchOptions,
     source_dir: &Path,
 ) -> Result<PathBuf, StitchError> {
@@ -329,15 +340,16 @@ fn determine_output_path(
     Ok(source_dir.join(default_name))
 }
 
-fn normalize_workers(workers: Option<usize>) -> usize {
+pub fn normalize_workers(workers: Option<usize>) -> usize {
     match workers {
         Some(value) if value > 0 => value,
         _ => num_cpus::get().max(1),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn normalize_sources(
-    window: &Window,
+    window: &ProgressSink,
     ffmpeg: &Path,
     ffprobe: &Path,
     sources: &[PathBuf],
@@ -376,7 +388,17 @@ async fn normalize_sources(
             match run_ffmpeg(&ffmpeg, args).await {
                 Ok(()) => {
                     let duration_ms = probe_duration(&ffprobe, &target).await?;
-                    let title = derive_chapter_title(&source, index + 1);
+                    let probed_title = match probe_chapter_title(&ffprobe, &source).await {
+                        Ok(title) => title,
+                        Err(err) => {
+                            log::warn!(
+                                "failed to probe chapter title for {}: {err}",
+                                source.display()
+                            );
+                            None
+                        }
+                    };
+                    let title = derive_chapter_title(&source, index + 1, probed_title.as_deref());
                     let finished = progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
                     emit_progress(
                         &window,
@@ -393,14 +415,14 @@ async fn normalize_sources(
                             total
                         )),
                     );
-                            Ok((
-                                index,
-                                NormalizedTrack {
-                                    normalized: target,
-                                    duration_ms,
-                                    title,
-                                },
-                            ))
+                    Ok((
+                        index,
+                        NormalizedTrack {
+                            normalized: target,
+                            duration_ms,
+                            title,
+                        },
+                    ))
                 }
                 Err(err) => {
                     emit_progress(
@@ -481,7 +503,7 @@ fn quote_path(path: &Path) -> String {
     quoted
 }
 
-fn escape_ffmetadata_value(value: &str) -> String {
+pub fn escape_ffmetadata_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -503,19 +525,35 @@ fn escape_ffmetadata_value(value: &str) -> String {
     escaped
 }
 
-fn derive_chapter_title(source: &Path, index: usize) -> String {
-    let fallback = format!("Chapter {}", index);
-    let stem = match source.file_stem().and_then(OsStr::to_str) {
-        Some(raw) if !raw.trim().is_empty() => raw,
-        _ => return fallback,
-    };
-    let cleaned = stem.replace('_', " ").replace('-', " ");
-    let trimmed = cleaned.trim();
+pub fn clean_title(raw: &str) -> Option<String> {
+    let spaced = raw.replace(['_', '-'], " ");
+    let trimmed = spaced.trim();
     if trimmed.is_empty() {
-        fallback
-    } else {
-        trimmed.to_string()
+        return None;
     }
+
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub fn derive_chapter_title(source: &Path, index: usize, probed_title: Option<&str>) -> String {
+    let fallback = format!("Chapter {}", index);
+
+    if let Some(title) = probed_title.and_then(clean_title) {
+        return title;
+    }
+
+    if let Some(file_stem) = source.file_stem().and_then(OsStr::to_str) {
+        if let Some(title) = clean_title(file_stem) {
+            return title;
+        }
+    }
+
+    fallback
 }
 
 async fn finalize_audiobook(
@@ -594,6 +632,7 @@ async fn finalize_audiobook(
 
 async fn run_ffmpeg(ffmpeg: &Path, args: Vec<OsString>) -> Result<(), StitchError> {
     let mut command = Command::new(ffmpeg);
+    command.kill_on_drop(true);
     command.args(&args);
     let command_str = to_command_string(ffmpeg, &args);
 
@@ -623,6 +662,7 @@ async fn probe_duration(ffprobe: &Path, file: &Path) -> Result<u64, StitchError>
     args.push(file.as_os_str().to_os_string());
 
     let mut command = Command::new(ffprobe);
+    command.kill_on_drop(true);
     command.args(&args);
     let command_str = to_command_string(ffprobe, &args);
 
@@ -658,6 +698,41 @@ async fn probe_duration(ffprobe: &Path, file: &Path) -> Result<u64, StitchError>
     Ok(duration_ms.max(1))
 }
 
+async fn probe_chapter_title(ffprobe: &Path, file: &Path) -> Result<Option<String>, StitchError> {
+    let mut args: Vec<OsString> = Vec::with_capacity(12);
+    args.push("-v".into());
+    args.push("error".into());
+    args.push("-show_entries".into());
+    args.push("format_tags=title:stream_tags=title".into());
+    args.push("-of".into());
+    args.push("default=noprint_wrappers=1:nokey=1".into());
+    args.push(file.as_os_str().to_os_string());
+
+    let mut command = Command::new(ffprobe);
+    command.kill_on_drop(true);
+    command.args(&args);
+    let command_str = to_command_string(ffprobe, &args);
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(StitchError::FfprobeFailed {
+            command: command_str,
+            code: output.status.code(),
+            stderr,
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let title = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string());
+
+    Ok(title)
+}
+
 fn to_command_string(executable: &Path, args: &[OsString]) -> String {
     let mut output = executable.display().to_string();
     for arg in args {
@@ -667,7 +742,7 @@ fn to_command_string(executable: &Path, args: &[OsString]) -> String {
     output
 }
 
-fn resolve_ffprobe(app: &AppHandle, ffmpeg_path: &Path) -> Result<PathBuf, StitchError> {
+fn resolve_ffprobe(ffmpeg_path: &Path) -> Result<PathBuf, StitchError> {
     if let Ok(custom) = env::var("FFPROBE_PATH") {
         let candidate = expand_path(&custom);
         if candidate.exists() {
@@ -686,20 +761,10 @@ fn resolve_ffprobe(app: &AppHandle, ffmpeg_path: &Path) -> Result<PathBuf, Stitc
         }
     }
 
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|_| StitchError::ResourcePath)?;
-    let bin_dir = resource_dir.join("bin").join(current_platform_directory());
-    let candidate = bin_dir.join(ffprobe_executable_name());
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    Err(StitchError::FfprobeNotFound)
+    binaries::find_bundled(ffprobe_executable_name()).ok_or(StitchError::FfprobeNotFound)
 }
 
-fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, StitchError> {
+fn resolve_ffmpeg() -> Result<PathBuf, StitchError> {
     if let Ok(custom) = env::var("FFMPEG_PATH") {
         let candidate = expand_path(&custom);
         if candidate.exists() {
@@ -711,29 +776,7 @@ fn resolve_ffmpeg(app: &AppHandle) -> Result<PathBuf, StitchError> {
         return Ok(path);
     }
 
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|_| StitchError::ResourcePath)?;
-    let bin_dir = resource_dir.join("bin").join(current_platform_directory());
-    let candidate = bin_dir.join(ffmpeg_executable_name());
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    Err(StitchError::FfmpegNotFound)
-}
-
-fn current_platform_directory() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos-universal"
-    } else if cfg!(target_os = "windows") {
-        "windows-x64"
-    } else if cfg!(target_os = "linux") {
-        "linux-x64"
-    } else {
-        "unknown"
-    }
+    binaries::find_bundled(ffmpeg_executable_name()).ok_or(StitchError::FfmpegNotFound)
 }
 
 fn ffmpeg_executable_name() -> &'static str {
@@ -752,7 +795,7 @@ fn ffprobe_executable_name() -> &'static str {
     }
 }
 
-fn build_metadata_map(options: &StitchOptions) -> BTreeMap<String, String> {
+pub fn build_metadata_map(options: &StitchOptions) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     if let Some(title) = options.title.as_ref().filter(|s| !s.is_empty()) {
         metadata.insert("title".into(), title.clone());
@@ -773,4 +816,120 @@ fn build_metadata_map(options: &StitchOptions) -> BTreeMap<String, String> {
     }
 
     metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        paths.sort_by(|a, b| natural_compare(a, b));
+        paths.iter().map(|p| p.display().to_string()).collect()
+    }
+
+    #[test]
+    fn natural_sort_orders_numbers_numerically() {
+        assert_eq!(
+            sorted(&["ch10.mp3", "ch2.mp3", "ch1.mp3"]),
+            ["ch1.mp3", "ch2.mp3", "ch10.mp3"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_is_case_insensitive() {
+        assert_eq!(sorted(&["b.mp3", "A.mp3"]), ["A.mp3", "b.mp3"]);
+    }
+
+    #[test]
+    fn natural_sort_ignores_directory_part() {
+        assert_eq!(sorted(&["z/01.mp3", "a/02.mp3"]), ["z/01.mp3", "a/02.mp3"]);
+    }
+
+    #[test]
+    fn clean_title_normalises_separators() {
+        assert_eq!(clean_title("01_The-Start"), Some("01 The Start".into()));
+        assert_eq!(clean_title("  a   b  "), Some("a b".into()));
+        assert_eq!(clean_title("_-_"), None);
+        assert_eq!(clean_title(""), None);
+    }
+
+    #[test]
+    fn derive_title_prefers_probe_then_stem_then_fallback() {
+        let p = Path::new("/x/03_the-end.mp3");
+        assert_eq!(derive_chapter_title(p, 3, Some("Real Title")), "Real Title");
+        assert_eq!(derive_chapter_title(p, 3, Some(" _ ")), "03 the end");
+        assert_eq!(derive_chapter_title(p, 3, None), "03 the end");
+        assert_eq!(
+            derive_chapter_title(Path::new("/x/---.mp3"), 7, None),
+            "Chapter 7"
+        );
+    }
+
+    #[test]
+    fn ffmetadata_escaping() {
+        assert_eq!(escape_ffmetadata_value("a=b;c#d\\e"), "a\\=b\\;c\\#d\\\\e");
+        assert_eq!(escape_ffmetadata_value("l1\nl2\r"), "l1\\nl2\\r");
+        assert_eq!(escape_ffmetadata_value("plain"), "plain");
+    }
+
+    #[test]
+    fn default_output_path_uses_folder_name() {
+        let o = StitchOptions::default();
+        assert_eq!(
+            determine_output_path(&o, Path::new("/books/Dune")).unwrap(),
+            PathBuf::from("/books/Dune/Dune.m4b")
+        );
+        let o = StitchOptions {
+            output_file: Some("/out/x.m4b".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            determine_output_path(&o, Path::new("/books/Dune")).unwrap(),
+            PathBuf::from("/out/x.m4b")
+        );
+    }
+
+    #[test]
+    fn metadata_map_falls_back_album_to_title() {
+        let o = StitchOptions {
+            title: Some("T".into()),
+            author: Some("A".into()),
+            narrator: Some("N".into()),
+            year: Some("2020".into()),
+            ..Default::default()
+        };
+        let m = build_metadata_map(&o);
+        assert_eq!(m["album"], "T");
+        assert_eq!(m["artist"], "A");
+        assert_eq!(m["album_artist"], "N");
+        assert_eq!(m["date"], "2020");
+        let o = StitchOptions {
+            title: Some("T".into()),
+            album: Some("Al".into()),
+            ..Default::default()
+        };
+        assert_eq!(build_metadata_map(&o)["album"], "Al");
+    }
+
+    #[test]
+    fn workers_default_to_cpu_count() {
+        assert_eq!(normalize_workers(Some(3)), 3);
+        assert!(normalize_workers(Some(0)) >= 1);
+        assert!(normalize_workers(None) >= 1);
+    }
+
+    #[test]
+    fn collects_only_supported_audio_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["10.mp3", "2.MP3", "notes.txt", "1.m4a"] {
+            File::create(dir.path().join(n)).unwrap();
+        }
+        let names: Vec<String> = collect_audio_files(dir.path())
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["1.m4a", "2.MP3", "10.mp3"]);
+    }
 }
