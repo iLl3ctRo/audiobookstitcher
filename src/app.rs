@@ -7,8 +7,8 @@ use std::{
 
 use gpui::{
     div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, size, AnyElement, App,
-    Application, Bounds, Context, Entity, IntoElement, PathPromptOptions, Render, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    Application, Bounds, Context, Entity, IntoElement, PathPromptOptions, Render, ScrollHandle,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -36,6 +36,7 @@ struct Tagged {
 
 const TEXT: u32 = 0xe2e8f0;
 const MUTED: u32 = 0x94a3b8;
+const STATUS_WIDTH: f32 = 380.;
 
 pub struct StitcherApp {
     runtime: Arc<tokio::runtime::Runtime>,
@@ -58,6 +59,10 @@ pub struct StitcherApp {
     validation_error: Option<String>,
     job_id: u64,
     result: Option<StitchResult>,
+    log_scroll: ScrollHandle,
+    /// The running stitch task, aborted on quit so its ffmpeg children are killed.
+    job_task: Option<tokio::task::AbortHandle>,
+    _quit_hook: gpui::Subscription,
 }
 
 fn make_input(
@@ -90,6 +95,10 @@ impl StitcherApp {
             .thread_name("stitch-worker")
             .build()
             .expect("failed to start tokio runtime");
+        let quit_hook = cx.on_app_quit(|this, _cx| {
+            this.abort_job();
+            async {}
+        });
         Self {
             runtime: Arc::new(runtime),
             source_dir: make_input(
@@ -119,6 +128,9 @@ impl StitcherApp {
             error: None,
             validation_error: None,
             job_id: 0,
+            log_scroll: ScrollHandle::new(),
+            job_task: None,
+            _quit_hook: quit_hook,
             result: None,
         }
     }
@@ -145,6 +157,7 @@ impl StitcherApp {
 
     fn append_log(&mut self, message: &str) {
         form::push_log(&mut self.log, format!("[{}] {message}", timestamp()));
+        self.log_scroll.scroll_to_bottom();
     }
 
     fn set_input(
@@ -264,6 +277,7 @@ impl StitcherApp {
             Ok(options) => options,
             Err(message) => {
                 self.validation_error = Some(message.to_string());
+                self.progress = None;
                 cx.notify();
                 return;
             }
@@ -288,23 +302,23 @@ impl StitcherApp {
             });
         });
         let failed_sink = sink.clone();
-        let runtime = self.runtime.clone();
-        self.runtime.spawn(async move {
-            let handle = runtime.spawn(async move {
-                match stitch_audiobook(sink, options).await {
-                    Ok(result) => Ok(result),
-                    Err(err) => {
-                        let message = err.to_string();
-                        failed_sink(StitchProgress {
-                            stage: ProgressStage::Failed,
-                            current: 0,
-                            total: 0,
-                            message: Some(message.clone()),
-                        });
-                        Err(message)
-                    }
+        let handle = self.runtime.spawn(async move {
+            match stitch_audiobook(sink, options).await {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    let message = err.to_string();
+                    failed_sink(StitchProgress {
+                        stage: ProgressStage::Failed,
+                        current: 0,
+                        total: 0,
+                        message: Some(message.clone()),
+                    });
+                    Err(message)
                 }
-            });
+            }
+        });
+        self.job_task = Some(handle.abort_handle());
+        self.runtime.spawn(async move {
             let outcome = match handle.await {
                 Ok(outcome) => outcome,
                 Err(_) => Err("stitch job panicked".to_string()),
@@ -343,6 +357,20 @@ impl StitcherApp {
             }
         })
         .detach();
+    }
+
+    /// Cancels the running job and waits briefly for it to be dropped. Dropping
+    /// it drops the ffmpeg `Child`ren, which `kill_on_drop` then kills. Without
+    /// this, quitting mid-job leaves ffmpeg running as orphans.
+    fn abort_job(&mut self) {
+        let Some(task) = self.job_task.take() else {
+            return;
+        };
+        task.abort();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !task.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn handle_message(&mut self, tagged: Tagged) {
@@ -516,8 +544,8 @@ impl StitcherApp {
 
         Self::card()
             .id("form")
-            .flex_grow()
-            .w_3_5()
+            .flex_1()
+            .min_w_0()
             .min_h_0()
             .gap_3()
             .child(fields)
@@ -591,15 +619,23 @@ impl StitcherApp {
                     ),
             )
             .child(Progress::new().value(percent as f32))
-            .child(div().text_sm().text_color(rgb(TEXT)).child(details));
+            // Only a short summary here; the full message lives in the Error card and log.
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .line_clamp(3)
+                    .text_ellipsis()
+                    .child(details),
+            );
 
         let mut panel = div()
-            .id("status")
             .flex()
             .flex_col()
-            .flex_1()
+            .flex_none()
+            .w(px(STATUS_WIDTH))
+            .min_h_0()
             .gap_5()
-            .overflow_y_scroll()
             .child(progress_card);
 
         if let Some(result) = &self.result {
@@ -651,7 +687,14 @@ impl StitcherApp {
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("Error"),
                     )
-                    .child(div().child(error.clone())),
+                    .child(
+                        div()
+                            .id("error-text")
+                            .max_h(px(160.))
+                            .overflow_y_scroll()
+                            .text_sm()
+                            .child(error.clone()),
+                    ),
             );
         }
 
@@ -670,6 +713,8 @@ impl StitcherApp {
         };
         panel.child(
             Self::card()
+                .flex_1()
+                .min_h(px(120.))
                 .gap_3()
                 .child(
                     div()
@@ -680,8 +725,10 @@ impl StitcherApp {
                 .child(
                     div()
                         .id("log-view")
-                        .max_h(px(240.))
+                        .flex_1()
+                        .min_h_0()
                         .overflow_y_scroll()
+                        .track_scroll(&self.log_scroll)
                         .text_xs()
                         .font_family("Menlo")
                         .text_color(rgb(0xcbd5e1))
@@ -734,10 +781,37 @@ impl Render for StitcherApp {
     }
 }
 
+gpui::actions!(audiobook_stitcher, [Quit]);
+
+fn set_menus(cx: &mut App) {
+    use gpui::{KeyBinding, Menu, MenuItem};
+    use gpui_component::input::{Copy, Cut, Paste, SelectAll};
+
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+    cx.set_menus(vec![
+        Menu {
+            name: "Audiobook Stitcher".into(),
+            items: vec![MenuItem::action("Quit Audiobook Stitcher", Quit)],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Cut", Cut),
+                MenuItem::action("Copy", Copy),
+                MenuItem::action("Paste", Paste),
+                MenuItem::separator(),
+                MenuItem::action("Select All", SelectAll),
+            ],
+        },
+    ]);
+}
+
 /// Opens the main window and runs the GPUI event loop.
 pub fn run() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
+        set_menus(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -746,7 +820,7 @@ pub fn run() {
         .detach();
         Theme::change(ThemeMode::Dark, None, cx);
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
+        let bounds = Bounds::centered(None, size(px(1100.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
