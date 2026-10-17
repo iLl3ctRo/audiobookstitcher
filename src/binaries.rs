@@ -72,7 +72,7 @@ pub fn candidate_paths(
         .collect()
 }
 
-/// Finds a bundled executable relative to the running binary (and, in debug
+/// Finds a bundled executable (ignoring empty placeholder files) relative to the running binary (and, in debug
 /// builds, the crate's own `resources/` directory).
 pub fn find_bundled(executable: &str) -> Option<PathBuf> {
     let exe_dir = std::env::current_exe()
@@ -85,7 +85,11 @@ pub fn find_bundled(executable: &str) -> Option<PathBuf> {
     };
     candidate_paths(exe_dir.as_deref(), manifest_dir.as_deref(), executable)
         .into_iter()
-        .find(|p| p.is_file())
+        .find(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+        })
 }
 
 #[cfg(test)]
@@ -99,7 +103,10 @@ mod tests {
             Some(Path::new("/src/proj")),
         );
         let p = platform_directory();
-        assert_eq!(dirs[0], Path::new("/App/Contents/MacOS/resources/bin").join(p));
+        assert_eq!(
+            dirs[0],
+            Path::new("/App/Contents/MacOS/resources/bin").join(p)
+        );
         assert_eq!(dirs[1], Path::new("/App/Contents/Resources/bin").join(p));
         assert_eq!(
             dirs[2],

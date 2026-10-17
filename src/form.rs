@@ -122,7 +122,10 @@ mod tests {
             source_dir: "   ".into(),
             ..Default::default()
         };
-        assert_eq!(f.to_options().unwrap_err(), "Select a source directory to continue.");
+        assert_eq!(
+            f.to_options().unwrap_err(),
+            "Select a source directory to continue."
+        );
     }
 
     #[test]

@@ -69,6 +69,18 @@ pub enum ProgressStage {
     Failed,
 }
 
+impl ProgressStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProgressStage::Scanning => "scanning",
+            ProgressStage::Normalizing => "normalizing",
+            ProgressStage::Finalizing => "finalizing",
+            ProgressStage::Complete => "complete",
+            ProgressStage::Failed => "failed",
+        }
+    }
+}
+
 /// Receives progress updates while a job runs. Callable from any thread.
 pub type ProgressSink = Arc<dyn Fn(StitchProgress) + Send + Sync>;
 
@@ -335,6 +347,7 @@ pub fn normalize_workers(workers: Option<usize>) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn normalize_sources(
     window: &ProgressSink,
     ffmpeg: &Path,
@@ -402,14 +415,14 @@ async fn normalize_sources(
                             total
                         )),
                     );
-                            Ok((
-                                index,
-                                NormalizedTrack {
-                                    normalized: target,
-                                    duration_ms,
-                                    title,
-                                },
-                            ))
+                    Ok((
+                        index,
+                        NormalizedTrack {
+                            normalized: target,
+                            duration_ms,
+                            title,
+                        },
+                    ))
                 }
                 Err(err) => {
                     emit_progress(
@@ -513,16 +526,13 @@ pub fn escape_ffmetadata_value(value: &str) -> String {
 }
 
 pub fn clean_title(raw: &str) -> Option<String> {
-    let spaced = raw.replace('_', " ").replace('-', " ");
+    let spaced = raw.replace(['_', '-'], " ");
     let trimmed = spaced.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let normalized = trimmed
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         None
     } else {
@@ -686,10 +696,7 @@ async fn probe_duration(ffprobe: &Path, file: &Path) -> Result<u64, StitchError>
     Ok(duration_ms.max(1))
 }
 
-async fn probe_chapter_title(
-    ffprobe: &Path,
-    file: &Path,
-) -> Result<Option<String>, StitchError> {
+async fn probe_chapter_title(ffprobe: &Path, file: &Path) -> Result<Option<String>, StitchError> {
     let mut args: Vec<OsString> = Vec::with_capacity(12);
     args.push("-v".into());
     args.push("error".into());
@@ -815,10 +822,7 @@ mod tests {
     fn sorted(names: &[&str]) -> Vec<String> {
         let mut paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
         paths.sort_by(|a, b| natural_compare(a, b));
-        paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect()
+        paths.iter().map(|p| p.display().to_string()).collect()
     }
 
     #[test]
