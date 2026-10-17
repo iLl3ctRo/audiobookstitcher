@@ -632,6 +632,7 @@ async fn finalize_audiobook(
 
 async fn run_ffmpeg(ffmpeg: &Path, args: Vec<OsString>) -> Result<(), StitchError> {
     let mut command = Command::new(ffmpeg);
+    command.kill_on_drop(true);
     command.args(&args);
     let command_str = to_command_string(ffmpeg, &args);
 
@@ -661,6 +662,7 @@ async fn probe_duration(ffprobe: &Path, file: &Path) -> Result<u64, StitchError>
     args.push(file.as_os_str().to_os_string());
 
     let mut command = Command::new(ffprobe);
+    command.kill_on_drop(true);
     command.args(&args);
     let command_str = to_command_string(ffprobe, &args);
 
@@ -707,6 +709,7 @@ async fn probe_chapter_title(ffprobe: &Path, file: &Path) -> Result<Option<Strin
     args.push(file.as_os_str().to_os_string());
 
     let mut command = Command::new(ffprobe);
+    command.kill_on_drop(true);
     command.args(&args);
     let command_str = to_command_string(ffprobe, &args);
 

@@ -3,7 +3,6 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
@@ -29,6 +28,12 @@ enum JobMessage {
     Done(Result<StitchResult, String>),
 }
 
+/// A message tagged with the id of the job that produced it.
+struct Tagged {
+    job: u64,
+    message: JobMessage,
+}
+
 const TEXT: u32 = 0xe2e8f0;
 const MUTED: u32 = 0x94a3b8;
 
@@ -49,6 +54,9 @@ pub struct StitcherApp {
     progress: Option<StitchProgress>,
     log: Vec<String>,
     error: Option<String>,
+    /// Form/cover validation message, kept separate from job errors.
+    validation_error: Option<String>,
+    job_id: u64,
     result: Option<StitchResult>,
 }
 
@@ -70,17 +78,8 @@ fn make_input(
 }
 
 fn timestamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as libc::time_t)
-        .unwrap_or(0);
-    // SAFETY: localtime_r only writes into the zeroed tm we hand it.
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        tm
-    };
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
 }
 
 impl StitcherApp {
@@ -118,6 +117,8 @@ impl StitcherApp {
             progress: None,
             log: Vec::new(),
             error: None,
+            validation_error: None,
+            job_id: 0,
             result: None,
         }
     }
@@ -191,11 +192,10 @@ impl StitcherApp {
                     this.update_in(cx, |this, window, cx| {
                         // The native picker cannot filter extensions, so validate here.
                         if form::has_extension(&value, &["jpg", "jpeg", "png"]) {
-                            this.error = None;
+                            this.validation_error = None;
                             Self::set_input(&this.cover_image, &value, window, cx);
                         } else {
-                            this.error =
-                                Some("Cover image must be a .jpg, .jpeg or .png file.".into());
+                            this.validation_error = Some(form::COVER_ERROR.into());
                         }
                         cx.notify();
                     })
@@ -251,6 +251,7 @@ impl StitcherApp {
         self.progress = None;
         self.log.clear();
         self.error = None;
+        self.validation_error = None;
         self.result = None;
         cx.notify();
     }
@@ -262,70 +263,96 @@ impl StitcherApp {
         let options = match self.form_state(cx).to_options() {
             Ok(options) => options,
             Err(message) => {
-                self.error = Some(message.to_string());
+                self.validation_error = Some(message.to_string());
                 cx.notify();
                 return;
             }
         };
 
         self.running = true;
+        self.job_id += 1;
+        let job = self.job_id;
         self.progress = None;
         self.error = None;
+        self.validation_error = None;
         self.result = None;
         self.append_log("Starting stitch job...");
         cx.notify();
 
-        let (tx, rx) = async_channel::unbounded::<JobMessage>();
+        let (tx, rx) = async_channel::unbounded::<Tagged>();
         let progress_tx = tx.clone();
         let sink: ProgressSink = Arc::new(move |p| {
-            let _ = progress_tx.try_send(JobMessage::Progress(p));
+            let _ = progress_tx.try_send(Tagged {
+                job,
+                message: JobMessage::Progress(p),
+            });
         });
         let failed_sink = sink.clone();
+        let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
-            let outcome = match stitch_audiobook(sink, options).await {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    let message = err.to_string();
-                    failed_sink(StitchProgress {
-                        stage: ProgressStage::Failed,
-                        current: 0,
-                        total: 0,
-                        message: Some(message.clone()),
-                    });
-                    Err(message)
+            let handle = runtime.spawn(async move {
+                match stitch_audiobook(sink, options).await {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        let message = err.to_string();
+                        failed_sink(StitchProgress {
+                            stage: ProgressStage::Failed,
+                            current: 0,
+                            total: 0,
+                            message: Some(message.clone()),
+                        });
+                        Err(message)
+                    }
                 }
+            });
+            let outcome = match handle.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err("stitch job panicked".to_string()),
             };
-            let _ = tx.try_send(JobMessage::Done(outcome));
+            let _ = tx.try_send(Tagged {
+                job,
+                message: JobMessage::Done(outcome),
+            });
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(message) = rx.recv().await {
-                let done = matches!(message, JobMessage::Done(_));
+            let mut finished = false;
+            while let Ok(tagged) = rx.recv().await {
+                let done = matches!(tagged.message, JobMessage::Done(_));
                 let alive = this
                     .update(cx, |this, cx| {
-                        this.handle_message(message);
+                        this.handle_message(tagged);
                         cx.notify();
                     })
                     .is_ok();
                 if done || !alive {
+                    finished = done;
                     break;
                 }
+            }
+            if !finished {
+                // Channel closed without a Done message: treat as failure.
+                this.update(cx, |this, cx| {
+                    this.handle_message(Tagged {
+                        job,
+                        message: JobMessage::Done(Err("stitch job ended unexpectedly".to_string())),
+                    });
+                    cx.notify();
+                })
+                .ok();
             }
         })
         .detach();
     }
 
-    fn handle_message(&mut self, message: JobMessage) {
-        match message {
+    fn handle_message(&mut self, tagged: Tagged) {
+        if tagged.job != self.job_id {
+            return; // stale message from an older job
+        }
+        match tagged.message {
             JobMessage::Progress(progress) => {
                 if let Some(text) = progress.message.as_deref().filter(|m| !m.is_empty()) {
                     self.append_log(text);
-                }
-                if matches!(
-                    progress.stage,
-                    ProgressStage::Complete | ProgressStage::Failed
-                ) {
-                    self.running = false;
                 }
                 self.progress = Some(progress);
             }
@@ -611,7 +638,7 @@ impl StitcherApp {
             );
         }
 
-        if let Some(error) = &self.error {
+        if let Some(error) = self.validation_error.as_ref().or(self.error.as_ref()) {
             panel = panel.child(
                 Self::card()
                     .gap_3()
@@ -711,6 +738,12 @@ impl Render for StitcherApp {
 pub fn run() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         Theme::change(ThemeMode::Dark, None, cx);
 
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);

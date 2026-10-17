@@ -4,6 +4,23 @@ use crate::stitcher::StitchOptions;
 
 pub const LOG_CAP: usize = 250;
 pub const EMPTY_SOURCE_ERROR: &str = "Select a source directory to continue.";
+pub const SAMPLE_RATE_ERROR: &str = "Sample rate must be a whole number, e.g. 44100";
+pub const WORKERS_ERROR: &str = "Workers must be a whole number or empty";
+pub const COVER_ERROR: &str = "Cover image must be a .jpg, .jpeg or .png file.";
+
+/// Empty -> `Ok(None)`; a positive integer -> `Ok(Some(n))`; anything else -> `Err(())`.
+fn parse_positive<T: std::str::FromStr + PartialEq + Default>(
+    value: &str,
+) -> Result<Option<T>, ()> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    match v.parse::<T>() {
+        Ok(n) if n != T::default() => Ok(Some(n)),
+        _ => Err(()),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormState {
@@ -44,12 +61,15 @@ fn opt(value: &str) -> Option<String> {
 }
 
 impl FormState {
-    /// Mirrors `buildPayload` + the empty-source validation of the React UI.
+    /// Mirrors `buildPayload` + the React validation, but rejects (instead of
+    /// silently ignoring) a non-empty sample rate / workers that isn't a positive integer.
     pub fn to_options(&self) -> Result<StitchOptions, &'static str> {
         let source_dir = self.source_dir.trim();
         if source_dir.is_empty() {
             return Err(EMPTY_SOURCE_ERROR);
         }
+        let sample_rate = parse_positive(&self.sample_rate).map_err(|_| SAMPLE_RATE_ERROR)?;
+        let workers = parse_positive(&self.workers).map_err(|_| WORKERS_ERROR)?;
         Ok(StitchOptions {
             source_dir: source_dir.to_string(),
             output_file: opt(&self.output_file),
@@ -60,8 +80,8 @@ impl FormState {
             year: opt(&self.year),
             cover_image: opt(&self.cover_image),
             bitrate: opt(&self.bitrate),
-            sample_rate: self.sample_rate.trim().parse().ok(),
-            workers: self.workers.trim().parse().ok(),
+            sample_rate,
+            workers,
         })
     }
 }
@@ -143,26 +163,55 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ints_ignored_and_values_trimmed() {
+    fn values_trimmed_and_ints_parsed() {
         let f = FormState {
             source_dir: "/a".into(),
-            sample_rate: "abc".into(),
-            workers: "-3".into(),
             title: "  Dune ".into(),
             bitrate: "  ".into(),
+            workers: " 4 ".into(),
+            sample_rate: " 48000 ".into(),
             ..Default::default()
         };
         let o = f.to_options().unwrap();
-        assert_eq!(o.sample_rate, None);
-        assert_eq!(o.workers, None);
         assert_eq!(o.title.as_deref(), Some("Dune"));
         assert_eq!(o.bitrate, None);
-        let g = FormState {
+        assert_eq!(o.workers, Some(4));
+        assert_eq!(o.sample_rate, Some(48000));
+    }
+
+    #[test]
+    fn empty_sample_rate_and_workers_are_none() {
+        let f = FormState {
             source_dir: "/a".into(),
-            workers: " 4 ".into(),
+            sample_rate: " ".into(),
             ..Default::default()
         };
-        assert_eq!(g.to_options().unwrap().workers, Some(4));
+        let o = f.to_options().unwrap();
+        assert_eq!((o.sample_rate, o.workers), (None, None));
+    }
+
+    #[test]
+    fn invalid_sample_rate_blocks() {
+        for bad in ["abc", "-1", "0", "44.1k", "44100x"] {
+            let f = FormState {
+                source_dir: "/a".into(),
+                sample_rate: bad.into(),
+                ..Default::default()
+            };
+            assert_eq!(f.to_options().unwrap_err(), SAMPLE_RATE_ERROR, "{bad}");
+        }
+    }
+
+    #[test]
+    fn invalid_workers_blocks() {
+        for bad in ["abc", "-3", "0", "2.5"] {
+            let f = FormState {
+                source_dir: "/a".into(),
+                workers: bad.into(),
+                ..Default::default()
+            };
+            assert_eq!(f.to_options().unwrap_err(), WORKERS_ERROR, "{bad}");
+        }
     }
 
     #[test]
